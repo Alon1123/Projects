@@ -79,7 +79,9 @@ try {
         # 6) Lookup LoadLibraryA address
         $hKernel = [Win32]::GetModuleHandle("kernel32.dll")
         $addrLL  = [Win32]::GetProcAddress($hKernel, "LoadLibraryA")
-        Write-Host "[+] LoadLibraryA @ 0x{0:X}" -f $addrLL.ToInt64()
+        # Build the formatted string first
+        $addrText = ("[+] LoadLibraryA @ 0x{0:X}" -f $addrLL.ToInt64())
+        Write-Host $addrText
 
         # 7) Spawn the remote thread
         Write-Host "[~] Creating remote thread..."
